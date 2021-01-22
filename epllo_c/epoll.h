@@ -132,8 +132,8 @@ static int apiUserEventRegister(eplloUserEvent* ev, int fd, int event, enum isRe
     ev->mask = mask;
     ev->lastActiveTime = time(NULL);
     ev->arg = arg;
-    memset(&ev->buffer, 0, MAX_BUF_SIZE);
-    ev->length = 0;
+    // memset(&ev->buffer, 0, MAX_BUF_SIZE);
+    // ev->length = 0;
     
     return 0;
 }
