@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
+#include "log.h"
+#include "epoll.h"
 
 #define MAX_BUFFER		128
 #define MAX_EPOLLSIZE	(384*1024)
@@ -38,7 +40,7 @@ static int ntySetReUseAddr(int fd) {
 
 int main(int argc, char **argv) {
 	if (argc <= 2) {
-		printf("Usage: %s ip port\n", argv[0]);
+		LOG_INFO("Usage: %s ip port", argv[0]);
 		exit(0);
 	}
 
@@ -97,7 +99,7 @@ int main(int argc, char **argv) {
 
 			// 将套接字设置为可读可写，然后加入到epoll_wait()中
 			ev.data.fd = sockfd;
-			ev.events = EPOLLIN | EPOLLOUT;
+			ev.events = EPOLLIN | EPOLLET;
 			epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &ev);
 		
 			connections ++;
@@ -113,7 +115,7 @@ int main(int argc, char **argv) {
 
 			// 打印一下每连接1000个客户端所消耗的时间
 			int time_used = TIME_SUB_MS(tv_begin, tv_cur);
-			printf("connections: %d, sockfd:%d, time_used:%d\n", connections, sockfd, time_used);
+			LOG_INFO("connections: %d, sockfd:%d, time_used:%d", connections, sockfd, time_used);
 
 			// 进行epoll_wait()
 			int nfds = epoll_wait(epoll_fd, events, connections, 100);
@@ -121,34 +123,47 @@ int main(int argc, char **argv) {
 			{
 				int clientfd = events[i].data.fd;
 
+				//LOG_INFO("clientfd:%d, events:%d", clientfd, events[i].events);
+
 				// 执行写
 				if (events[i].events & EPOLLOUT) {
 					sprintf(buffer, "data from %d\n", clientfd);
 					send(sockfd, buffer, strlen(buffer), 0);
+					
+					ev.data.fd=sockfd;
+               	 	ev.events=EPOLLIN | EPOLLET;
+                	epoll_ctl(epoll_fd, EPOLL_CTL_MOD,sockfd,&ev);
 				} 
 				// 执行读
 				else if (events[i].events & EPOLLIN) {
 					char rBuffer[MAX_BUFFER] = {0};				
 					ssize_t length = recv(sockfd, rBuffer, MAX_BUFFER, 0);
 					if (length > 0) {
-						printf(" RecvBuffer:%s\n", rBuffer);
+						LOG_INFO(" RecvBuffer:%s", rBuffer);
 
 						if (!strcmp(rBuffer, "quit")) {
 							isContinue = 0;
 						}
 						
 					} else if (length == 0) {
-						printf(" Disconnect clientfd:%d\n", clientfd);
+						LOG_INFO(" Disconnect clientfd:%d", clientfd);
 						connections --;
 						close(clientfd);
 					} else {
 						if (errno == EINTR) continue;
+						if (errno == EAGAIN || errno == EWOULDBLOCK) {
+							continue;
+						}	
 
-						printf(" Error clientfd:%d, errno:%d\n", clientfd, errno);
+						LOG_INFO(" Error clientfd:%d, errno:%s", clientfd, strerror(errno));
 						close(clientfd);
 					}
+					ev.data.fd=sockfd;
+               	 	ev.events=EPOLLOUT | EPOLLET;
+                	epoll_ctl(epoll_fd, EPOLL_CTL_MOD,sockfd,&ev);
+
 				} else {
-					printf(" clientfd:%d, errno:%d\n", clientfd, errno);
+					LOG_INFO(" clientfd:%d, errno:%s", clientfd, strerror(errno));
 					close(clientfd);
 				}
 			}

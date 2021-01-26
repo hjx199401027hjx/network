@@ -33,18 +33,21 @@ typedef struct eplloUserEvent
     int length;                             //缓冲区数据长度
     enum isRegisterEpoll mask;              //事件是否有在epoll_fd中注册
     long lastActiveTime;                    //上次事件调用的活跃时间
+    char* ip;                               //对应的fd IP
+    int port;                               //对应的fd 端口
 }eplloUserEvent;
 
 //事件
 typedef struct eplloReactor
 {
     int epollFd;
+    int listenFd;
     eplloUserEvent* reactorEvents;
 }eplloReactor;
 
 static int apiSetReUseAddr(int fd);
 static int apiSetNoBlock(int listenFd);
-static int apiUserEventRegister(eplloUserEvent* ev, int fd, int event, enum isRegisterEpoll mask, callBack callFun, void *arg);
+static int apiUserEventRegister(eplloUserEvent* ev, int fd, char*Ip, int port, int event, enum isRegisterEpoll mask, callBack callFun, void *arg);
 static int apiEventAdd(int epollFd, eplloUserEvent* ev);
 static void apiRecvMsgCallFun(int fd, int event, void* ptr);
 static void apiSendMsgCallFun(int d, int event, void* ptr);
@@ -83,8 +86,11 @@ static int apiInitServer(char* ip, short port, eplloReactor* reactor) {
     }
     LOG_INFO("Listen start [%s:%d] in fd:%d ...", inet_ntoa(server.sin_addr), ntohs(server.sin_port), sockFd);
 
+    reactor->listenFd = sockFd;
     apiUserEventRegister(&reactor->reactorEvents[sockFd], 
                         sockFd,
+                        inet_ntoa(server.sin_addr),
+                        ntohs(server.sin_port),
                         EPOLLIN,
                         REGISTER_NOT,
                         apiAcceptCallFun,
@@ -120,7 +126,7 @@ static eplloReactor* apiCreateReactor() {
     return reactor;
 }
 
-static int apiUserEventRegister(eplloUserEvent* ev, int fd, int event, enum isRegisterEpoll mask, callBack callFun, void *arg){
+static int apiUserEventRegister(eplloUserEvent* ev, int fd, char*Ip, int port, int event, enum isRegisterEpoll mask, callBack callFun, void *arg){
     if (ev == NULL || fd < 0 || callFun == NULL || arg == NULL) {
         LOG_INFO("apiEventRegister error, errno:%s", strerror(errno));
         return -1; 
@@ -132,6 +138,8 @@ static int apiUserEventRegister(eplloUserEvent* ev, int fd, int event, enum isRe
     ev->mask = mask;
     ev->lastActiveTime = time(NULL);
     ev->arg = arg;
+    ev->ip = Ip;
+    ev->port = port;
     // memset(&ev->buffer, 0, MAX_BUF_SIZE);
     // ev->length = 0;
     
@@ -176,7 +184,7 @@ static int apiEventDeL(int epollFd, eplloUserEvent* ev){
 
     struct epoll_event epollEvent;
     memset(&epollEvent, 0 ,sizeof(epollEvent));
-    epollEvent.events = REGISTER_NOT;
+    ev->mask = REGISTER_NOT;
     epollEvent.data.ptr = ev;
     //epollEvent.data.fd = ev->fd;   //data成员是一个联合体, 不能同时使用fd和ptr成员
 
@@ -220,13 +228,13 @@ static void apiAcceptCallFun(int fd, int event, void* ptr) {
     socklen_t len = sizeof(struct sockaddr_in);
     memset(&client, 0 ,sizeof(struct sockaddr_in));
     int clientFd = accept(ev->fd, (struct sockaddr*)&client, (socklen_t*)&len);
-    LOG_INFO("fd: %d", ev->fd);
+    LOG_INFO("epollFd:%d, clientFd: %d", reactor->epollFd, clientFd);
     if (clientFd < 0) {
         LOG_INFO("apiAcceptCallFun %d error, errno:%s", ev->fd, strerror(errno));
         return; 
     }
 
-    int pos =0;
+    int pos = 0;
     do {
         for (pos = 7; pos < MAX_EPOLL_EVENT; ++pos) {
             if (reactor->reactorEvents[pos].mask == REGISTER_NOT) {
@@ -240,8 +248,7 @@ static void apiAcceptCallFun(int fd, int event, void* ptr) {
         }
 
         apiSetNoBlock(clientFd);
-
-        apiUserEventRegister(&reactor->reactorEvents[clientFd], clientFd, EPOLLIN, REGISTER_NOT, apiRecvMsgCallFun, reactor);
+        apiUserEventRegister(&reactor->reactorEvents[clientFd], clientFd, inet_ntoa(client.sin_addr), htons(client.sin_port), EPOLLIN, REGISTER_NOT, apiRecvMsgCallFun, reactor);
         apiEventAdd(reactor->epollFd, &reactor->reactorEvents[clientFd]);
     } while(0);
 
@@ -265,15 +272,15 @@ static void apiSendMsgCallFun(int fd, int event, void* ptr) {
         if (nByte > 0) {
             apiEventDeL(reactor->epollFd, ev);
             LOG_INFO("Send[fd = %d]: %s", ev->fd, ev->buffer);
-            apiUserEventRegister(ev, ev->fd, EPOLLIN, REGISTER_NOT, apiRecvMsgCallFun, reactor);
+            apiUserEventRegister(ev, ev->fd, ev->ip, ev->port, EPOLLIN, REGISTER_NOT, apiRecvMsgCallFun, reactor);
             apiEventAdd(reactor->epollFd, ev);
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             }
             LOG_INFO("apiSendMsgCallFun error , errno: %s", strerror(errno));
-            close(ev->fd);
             apiEventDeL(reactor->epollFd, ev);
+            close(ev->fd);
         }
     }while(0);
 
@@ -295,7 +302,7 @@ static void apiRecvMsgCallFun(int fd, int event, void* ptr) {
             ev->buffer[nByte] = '\0';
             ev->length = strlen(ev->buffer);
             LOG_INFO("recv[fd = %d]: %s", ev->fd, ev->buffer);
-            apiUserEventRegister(ev, ev->fd, EPOLLOUT, REGISTER_NOT, apiSendMsgCallFun, reactor);
+            apiUserEventRegister(ev, ev->fd, ev->ip, ev->port, EPOLLOUT, REGISTER_NOT, apiSendMsgCallFun, reactor);
             apiEventAdd(reactor->epollFd, ev);
         } else if (nByte == 0) {
             LOG_INFO("Client closed the connection , fd: %d", ev->fd);
@@ -314,17 +321,26 @@ static void apiRecvMsgCallFun(int fd, int event, void* ptr) {
 
 static int apiTimeOutRemoveClient(eplloReactor* reactor, int timeOutLimit) {
     long nowTime = time(NULL);
-    for (int i = 0; i <= MAX_EPOLL_EVENT; i++) {
-        if (i == MAX_EPOLL_EVENT) i = 0;
-        if (reactor->reactorEvents[i].mask == REGISTER_NOT) {
+    int checkPos = 0;
+    for (int i = 0; i <= 100; i++, checkPos++) {
+        if (checkPos == MAX_EPOLL_EVENT) { 
+            checkPos = 0;
+        }
+        
+        //没有注册过的cfd
+        if (reactor->reactorEvents[checkPos].mask == REGISTER_NOT) {
             continue;
         }
 
         //如果活跃的时间低于60s，主动关闭客户端的连接
-        long durTime = nowTime - reactor->reactorEvents[i].lastActiveTime; 
-        if (durTime >= timeOutLimit) {
-            close(reactor->reactorEvents[i].fd);
-            apiEventDeL(reactor->epollFd, &reactor->reactorEvents[i]);
+        long durTime = nowTime - reactor->reactorEvents[checkPos].lastActiveTime;
+        if (durTime >= timeOutLimit && reactor->reactorEvents[checkPos].fd != reactor->listenFd) {
+            LOG_INFO("客户端[%s:%d]in [fd: %d]超时连接", 
+                reactor->reactorEvents[checkPos].ip,
+                reactor->reactorEvents[checkPos].port,
+                reactor->reactorEvents[checkPos].fd)
+            apiEventDeL(reactor->epollFd, &reactor->reactorEvents[checkPos]);
+            close(reactor->reactorEvents[checkPos].fd);
         }
     }
 }
@@ -336,10 +352,10 @@ static int apiRun(eplloReactor* reactor){
     }
 
     struct epoll_event events[MAX_EPOLL_EVENT + 1];
-    int timeOutLimit = 60;
+    int timeOutLimit = 5;
     while (true) {
         //超时
-        //apiTimeOutRemoveClient(reactor, timeOutLimit);
+        apiTimeOutRemoveClient(reactor, timeOutLimit);
         int nEventReady = epoll_wait(reactor->epollFd, events, MAX_EPOLL_EVENT, 1000);
         if (nEventReady < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
